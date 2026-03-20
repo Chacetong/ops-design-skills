@@ -23,7 +23,7 @@ ops-prompt（生成绘图 prompt）
   │  有参考图 → expand_prompt + text_prompt
 
   ▼
-output/YYMMDD-NN/banner_<title>.png（缩放至 1920x960）
+{project_root}/output/YYMMDD-NN/banner_<title>.png（缩放至 1920x960）
 ```
   │
   ▼
@@ -36,6 +36,7 @@ ops-gen（生成图片）
 - 输入：用户自然语言描述 + 可选图片
 - 输出：结构化 brief JSON（含 `creative_concept`）
 - 此步骤会处理：标题翻译、图片用途判断、产出统一创意概念
+- **注意**：参考图只需下载到 `/tmp/`，**不要**额外转存到 drafts/；`generate_image.py` 会自动复制，避免重复文件
 
 ### Step 2：生成绘图 Prompt → `/ops-prompt`
 
@@ -56,7 +57,7 @@ ops-gen（生成图片）
 - **调整创意方向**：重新调用 `/ops-brief`
 - **调整 prompt**：重新调用 `/ops-prompt`
 - **重新生成**：重新调用 `/ops-gen`（同一 prompt 每次结果不同）
-- **文字不理想**：修改 prompt 中文字相关描述后重新生成
+- **文字不理想**：调用 `ops-prompt` 生成新 `text_prompt`，脚本检测到 `expanded.png` 已存在后自动跳过 squarify 和 expand，直接加文字
 
 ### 迭代过程管理
 
@@ -66,11 +67,12 @@ ops-gen（生成图片）
    <用户的修改建议原文>
    ```
 
-2. **文件版本管理**：迭代重新生成时，不覆盖已有文件，在同位置创建新版本文件：
+2. **文件版本管理**：迭代重新生成时，不覆盖已有文件，创建新版本文件：
    - 首次：`with_text.png`、`expanded.png`、`banner_<title>.png`
    - 第二次：`with_text_v2.png`、`expanded_v2.png`、`banner_<title>_v2.png`
-   - 第三次：`with_text_v3.png`、`expanded_v3.png`、`banner_<title>_v3.png`
-   - 仅重新生成的步骤产出新版本文件（如只重做文字步骤，则只有 `with_text_vN.png` 和 `banner_<title>_vN.png`）
+   - 以此类推……
+   - **仅重做文字时**：只产出 `with_text_vN.png` 和 `banner_<title>_vN.png`，不产出新 `expanded_vN.png`
+   - **文字迭代基底**：始终使用 `drafts/` 下编号最大的 `expanded*.png`（即当前活跃扩图），而非固定使用 `expanded.png`
 
 ## 共享资源
 
@@ -103,7 +105,8 @@ output/
     drafts/
       request.txt                   ← 用户原始需求 + 追加的修改建议
       base.png                      ← 底图（无参考图时由 AI 生成）
-      reference.png                 ← 用户参考图（有参考图时）
+      reference.png/webp            ← 用户参考图（有参考图时）
+      square.png                    ← 1:1 正方形中间图（竖版参考图时自动生成）
       expanded.png                  ← 扩图 v1
       expanded_v2.png               ← 扩图 v2（迭代后，若该步骤重做）
       with_text.png                 ← 加文字 v1

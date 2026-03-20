@@ -9,9 +9,17 @@ Base image is either user-provided (--reference) or AI-generated (OpenAI).
     2. Expand to 2:1 via Gemini (no text)
     3. Add title text via Gemini
 
-  With --reference:
+  With --reference (portrait, aspect < SQUARE_THRESHOLD):
+    0. Squarify portrait reference to 1:1 via Gemini (preserves subject)
+    1. Expand 1:1 square to 2:1 via Gemini (no text)
+    2. Add title text via Gemini
+
+  With --reference (already wide, aspect >= SQUARE_THRESHOLD):
     1. Expand reference to 2:1 via Gemini (no text)
     2. Add title text via Gemini
+
+  Text-only (auto-detected when --save-intermediate path already exists):
+    1. Add title text via Gemini (reuses existing expanded image)
 
 Usage:
     # No reference (generate base + expand + text)
@@ -25,6 +33,13 @@ Usage:
     python3 generate_image.py --prompt "<fallback>" \
         --expand-prompt "..." --text-prompt "..." \
         --output output/drafts/with_text.png \
+        --reference img.png \
+        --save-intermediate output/drafts/expanded.png
+
+    # Text-only iteration (auto-detected: expanded.png already exists)
+    python3 generate_image.py --prompt "<fallback>" \
+        --text-prompt "..." \
+        --output output/drafts/with_text_v2.png \
         --reference img.png \
         --save-intermediate output/drafts/expanded.png
 
@@ -53,6 +68,10 @@ from utils import decode_and_save, validate_image
 
 DEFAULT_MODEL = os.environ.get("IMAGE_MODEL", "gpt-image-1.5")
 DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-image-preview")
+
+# Reference images with aspect ratio (w/h) below this threshold are portrait and
+# will be squarified to 1:1 before expansion to reduce distortion.
+SQUARE_THRESHOLD = 0.85
 
 
 def _get_gemini_client():
@@ -112,6 +131,58 @@ def _gemini_generate(prompt: str, reference_images: List[str], model: str) -> by
     raise RuntimeError("Gemini returned no image in response")
 
 
+def squarify_portrait_reference(
+    reference_path: str,
+    model: str = "",
+    save_path: str = "",
+) -> str:
+    """Reframe a portrait reference image to 1:1 square via Gemini generation.
+
+    Checks the aspect ratio of reference_path. If w/h < SQUARE_THRESHOLD (portrait),
+    calls Gemini to generate a square version that preserves the main subject while
+    extending the background naturally. This reduces the aspect-ratio jump in the
+    subsequent 2:1 expansion step, preventing subject distortion/compression.
+
+    Returns the path to the square image (save_path if provided, else a temp file).
+    If the image is already wide enough, returns reference_path unchanged.
+    """
+    from PIL import Image
+
+    img = Image.open(reference_path)
+    w, h = img.size
+    aspect = w / h
+
+    if aspect >= SQUARE_THRESHOLD:
+        print(f"  Step 0: Skipped squarify (aspect={aspect:.2f} >= {SQUARE_THRESHOLD})")
+        return reference_path
+
+    gemini_model = model or DEFAULT_GEMINI_MODEL
+    print(f"  Step 0/3: Squarifying portrait reference (aspect={aspect:.2f} → 1:1, {gemini_model})...")
+
+    square_prompt = (
+        "Redraw this image as a perfect square 1:1 composition. "
+        "Keep the main subject completely intact — same proportions, same art style, same details. "
+        "Extend the background naturally in all directions to fill the square frame, "
+        "matching the original color palette and style seamlessly. "
+        "The subject should feel naturally positioned and fill the frame well. "
+        "No text. No letters. Square 1:1 aspect ratio."
+    )
+
+    square_bytes = _gemini_generate(square_prompt, [reference_path], gemini_model)
+
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(save_path).write_bytes(square_bytes)
+        print(f"  Square intermediate saved: {save_path}")
+        return save_path
+    else:
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp.write(square_bytes)
+        tmp.close()
+        return tmp.name
+
+
 def generate_with_reference(
     expand_prompt: str,
     text_prompt: str,
@@ -128,8 +199,8 @@ def generate_with_reference(
     """
     gemini_model = model or DEFAULT_GEMINI_MODEL
 
-    # Step 1: Expand
-    print(f"  Step 1/2: Expanding image ({gemini_model})...")
+    # Expand to 2:1
+    print(f"  Expanding image to 2:1 ({gemini_model})...")
     expanded_bytes = _gemini_generate(expand_prompt, reference_images, gemini_model)
 
     # Save intermediate if path provided
@@ -139,15 +210,15 @@ def generate_with_reference(
         print(f"  Intermediate saved: {intermediate_path}")
         expanded_ref = intermediate_path
     else:
-        # Save to temp file for step 2
+        # Save to temp file for text step
         import tempfile
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         tmp.write(expanded_bytes)
         tmp.close()
         expanded_ref = tmp.name
 
-    # Step 2: Add text
-    print(f"  Step 2/2: Adding text ({gemini_model})...")
+    # Add title text
+    print(f"  Adding title text ({gemini_model})...")
     final_bytes = _gemini_generate(text_prompt, [expanded_ref], gemini_model)
 
     # Clean up temp file
@@ -155,6 +226,21 @@ def generate_with_reference(
         os.unlink(expanded_ref)
 
     return final_bytes
+
+
+def add_text_only(
+    text_prompt: str,
+    expanded_image: str,
+    model: str = "",
+) -> bytes:
+    """Text-only step: add title text to an already-expanded image.
+
+    Used for iterating on typography without re-running the expand step.
+    Returns raw image bytes of the final result.
+    """
+    gemini_model = model or DEFAULT_GEMINI_MODEL
+    print(f"  Adding title text (text-only mode, {gemini_model})...")
+    return _gemini_generate(text_prompt, [expanded_image], gemini_model)
 
 
 def generate_full(client: OpenAI, prompt: str, size: str, model: str) -> str:
@@ -179,6 +265,7 @@ def main():
                         help=f"Gemini model (default: {DEFAULT_GEMINI_MODEL})")
     parser.add_argument("--base-size", default="1536x1024", help="Base image size (default: 1536x1024). Supported: 1024x1024, 1024x1536, 1536x1024")
     parser.add_argument("--save-base", help="Save base image to this path (full_generate)")
+    parser.add_argument("--save-square", help="Save squarified portrait intermediate to this path")
     parser.add_argument("--save-intermediate", help="Save expanded image to this path")
     parser.add_argument("--request", help="Original user request text, saved to drafts/request.txt")
     args = parser.parse_args()
@@ -200,25 +287,58 @@ def main():
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
 
     if args.reference:
-        # Copy reference images into drafts folder for traceability
         drafts_dir = Path(args.output).parent
+        expand_prompt = args.expand_prompt or args.prompt
+        text_prompt = args.text_prompt or args.prompt
+
+        # Auto-detect text-only: if expanded intermediate already exists, skip squarify + expand
+        intermediate_path = args.save_intermediate or ""
+        if intermediate_path and Path(intermediate_path).exists():
+            print(f"Expanded image found, skipping squarify and expand...")
+            raw_bytes = add_text_only(text_prompt, intermediate_path, args.gemini_model)
+            Path(args.output).write_bytes(raw_bytes)
+            output_path = Path(args.output)
+            if validate_image(str(output_path)):
+                print(f"Saved: {output_path}")
+            else:
+                print("Error: Generated image is invalid")
+                sys.exit(1)
+            return
+
+        # Copy reference images into drafts folder for traceability
         for i, ref in enumerate(args.reference):
             ext = Path(ref).suffix
             dest_name = f"reference{ext}" if len(args.reference) == 1 else f"reference_{i + 1}{ext}"
             dest = drafts_dir / dest_name
-            shutil.copy2(ref, dest)
-            print(f"  Reference copied: {dest}")
+            if Path(ref).resolve() != dest.resolve():
+                shutil.copy2(ref, dest)
+                print(f"  Reference copied: {dest}")
 
-        # Two-step Gemini: expand + text
-        expand_prompt = args.expand_prompt or args.prompt
-        text_prompt = args.text_prompt or args.prompt
-        print(f"Generating with reference (two-step, gemini_model={args.gemini_model})...")
+        # Step 0 (conditional): squarify portrait reference before expansion
+        references_for_expand = list(args.reference)
+        square_temp = None
+        if len(references_for_expand) == 1:
+            save_square = args.save_square or str(drafts_dir / "square.png")
+            squarified = squarify_portrait_reference(
+                references_for_expand[0],
+                model=args.gemini_model,
+                save_path=save_square,
+            )
+            if squarified != references_for_expand[0]:
+                references_for_expand = [squarified]
+                if squarified != save_square:
+                    square_temp = squarified  # temp file to clean up later
+
+        print(f"Generating banner (gemini_model={args.gemini_model})...")
         raw_bytes = generate_with_reference(
-            expand_prompt, text_prompt, args.reference,
+            expand_prompt, text_prompt, references_for_expand,
             args.gemini_model, args.save_intermediate or "",
         )
         Path(args.output).write_bytes(raw_bytes)
         output_path = Path(args.output)
+
+        if square_temp:
+            os.unlink(square_temp)
     else:
         # No reference: generate 4:3 base via OpenAI, then expand + text via Gemini
         print(f"Generating base image ({args.model}, {args.base_size})...")

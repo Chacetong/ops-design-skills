@@ -9,7 +9,9 @@ from typing import Optional
 
 from PIL import Image
 
-OUTPUT_ROOT = Path("output")
+# Project root is 5 levels up from this file:
+# {project_root}/.claude/skills/ops-design/scripts/utils.py
+OUTPUT_ROOT = Path(__file__).resolve().parents[4] / "output"
 
 
 def create_task_dir() -> Path:
